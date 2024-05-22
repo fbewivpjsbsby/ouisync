@@ -87,7 +87,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         with:
           name: build-${{ matrix.os }}
-          path: target/release/
+          path: target/
 
   check_kotlin_bindings:
     name: check kotlin bindings
