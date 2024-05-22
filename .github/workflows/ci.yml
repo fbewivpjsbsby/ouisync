@@ -84,6 +84,11 @@ jobs:
         if: matrix.name == 'linux'
         run: ${{ matrix.cargo-command }} test --package ouisync-cli --test cli
 
+      - uses: actions/upload-artifact@v3
+        with:
+          name: build-${{ matrix.os }}
+          path: target/release/
+
   check_kotlin_bindings:
     name: check kotlin bindings
     runs-on: ubuntu-latest
