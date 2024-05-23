@@ -84,7 +84,8 @@ jobs:
         if: matrix.name == 'linux'
         run: ${{ matrix.cargo-command }} test --package ouisync-cli --test cli
 
-      - name: Build
+      - name: Build cli
+        if: matrix.name == 'linux' || matrix.name == 'windows'
         run: ${{ matrix.cargo-command }} build --release --bin ouisync
 
       - uses: actions/upload-artifact@v3
