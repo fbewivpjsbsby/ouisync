@@ -3,7 +3,7 @@ use crate::{
     error::Error,
     file, network,
     protocol::{Request, Response},
-    repository, share_token,
+    repository, session, share_token,
     state::State,
     state_monitor,
 };
@@ -61,6 +61,20 @@ impl ouisync_bridge::transport::Handler for Handler {
             }
             Request::RepositorySubscribe(handle) => {
                 repository::subscribe(&self.state, &context.notification_tx, handle)?.into()
+            }
+            Request::ListRepositories => {
+                // TODO: We could collect only once
+                let handles = self
+                    .state
+                    .repositories
+                    .collect()
+                    .iter()
+                    .map(|(handle, _holder)| handle.id())
+                    .collect();
+                Response::Handles(handles)
+            }
+            Request::ListRepositoriesSubscribe => {
+                session::subscribe(&self.state, &context.notification_tx).into()
             }
             Request::RepositoryIsSyncEnabled(handle) => {
                 repository::is_sync_enabled(&self.state, handle)
@@ -125,8 +139,17 @@ impl ouisync_bridge::transport::Handler for Handler {
             Request::RepositoryDatabaseId(handle) => {
                 repository::database_id(&self.state, handle).await?.into()
             }
+            Request::RepositoryName(handle) => {
+                let os_str = repository::get_name(&self.state, handle)?;
+                os_str.as_encoded_bytes().to_vec().into()
+            }
             Request::RepositoryEntryType { repository, path } => {
                 repository::entry_type(&self.state, repository, path)
+                    .await?
+                    .into()
+            }
+            Request::RepositoryEntryVersionHash { repository, path } => {
+                repository::entry_version_hash(&self.state, repository, path)
                     .await?
                     .into()
             }
@@ -184,6 +207,12 @@ impl ouisync_bridge::transport::Handler for Handler {
                     .await?
                     .into()
             }
+            Request::RepositoryMount(repository) => {
+                repository::mount(&self.state, repository)?.into()
+            }
+            Request::RepositoryUnmount(repository) => {
+                repository::unmount(&self.state, repository)?.into()
+            }
             Request::ShareTokenMode(token) => share_token::mode(token).into(),
             Request::ShareTokenInfoHash(token) => share_token::info_hash(token).into(),
             Request::ShareTokenSuggestedName(token) => share_token::suggested_name(token).into(),
@@ -224,6 +253,11 @@ impl ouisync_bridge::transport::Handler for Handler {
             Request::DirectoryOpen { repository, path } => {
                 directory::open(&self.state, repository, path).await?.into()
             }
+            Request::DirectoryExists { repository, path } => {
+                directory::exists(&self.state, repository, path)
+                    .await?
+                    .into()
+            }
             Request::DirectoryRemove {
                 repository,
                 path,
@@ -236,6 +270,9 @@ impl ouisync_bridge::transport::Handler for Handler {
             }
             Request::FileCreate { repository, path } => {
                 file::create(&self.state, repository, path).await?.into()
+            }
+            Request::FileExists { repository, path } => {
+                file::exists(&self.state, repository, path).await?.into()
             }
             Request::FileRemove { repository, path } => {
                 file::remove(&self.state, repository, path).await?.into()

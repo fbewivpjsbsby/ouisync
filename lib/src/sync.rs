@@ -11,11 +11,12 @@ use tokio_stream::wrappers::WatchStream;
 
 /// Similar to tokio::sync::watch, but has no initial value. Because there is no initial value the
 /// API must be sligthly different. In particular, we don't have the `borrow` function.
-pub(crate) mod uninitialized_watch {
+pub mod uninitialized_watch {
     use futures_util::{stream, Stream};
     use tokio::sync::watch as w;
     pub use w::error::RecvError;
 
+    #[derive(Clone)]
     pub struct Sender<T>(w::Sender<Option<T>>);
 
     impl<T> Sender<T> {
@@ -82,7 +83,7 @@ pub(crate) mod uninitialized_watch {
 //       // Do some async tasks.
 //     });
 //
-//     on_dropped.recv().await;
+//     on_dropped.await;
 //
 pub struct DropAwaitable {
     tx: watch::Sender<()>,
@@ -231,10 +232,6 @@ pub(crate) mod broadcast_hash_set {
             }
 
             Ok(new_set)
-        }
-
-        pub fn is_closed(&self) -> bool {
-            self.watch_rx.is_closed()
         }
     }
 
@@ -656,6 +653,10 @@ pub(crate) mod delay_map {
         pub fn len(&self) -> usize {
             self.items.len()
         }
+
+        // pub fn is_empty(&self) -> bool {
+        //     self.items.is_empty()
+        // }
 
         /// Poll for the next expired item. This can be wrapped in `future::poll_fn` and awaited.
         /// Returns `Poll::Ready(None)` if the map is empty.

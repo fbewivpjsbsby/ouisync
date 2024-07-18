@@ -1,6 +1,5 @@
 use super::{
     barrier::{Barrier, BarrierError},
-    choke,
     client::Client,
     connection::ConnectionPermit,
     constants::MAX_IN_FLIGHT_REQUESTS_PER_PEER,
@@ -15,7 +14,6 @@ use super::{
 };
 use crate::{
     collections::{hash_map::Entry, HashMap},
-    network::constants::MAX_PENDING_REQUESTS_PER_CLIENT,
     repository::{LocalId, Vault},
 };
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
@@ -47,27 +45,20 @@ pub(super) struct MessageBroker {
     pex_peer: PexPeer,
     monitor: StateMonitor,
     tracker: TrafficTracker,
-    span: Span,
+    span: SpanGuard,
 }
 
 impl MessageBroker {
     pub fn new(
         this_runtime_id: PublicRuntimeId,
         that_runtime_id: PublicRuntimeId,
-        stream: raw::Stream,
-        permit: ConnectionPermit,
         pex_peer: PexPeer,
         monitor: StateMonitor,
         tracker: TrafficTracker,
     ) -> Self {
-        let span = tracing::info_span!(
-            "message_broker",
-            message = ?that_runtime_id.as_public_key(),
-        );
+        let span = SpanGuard::new(&that_runtime_id);
 
-        tracing::info!(parent: &span, "Message broker created");
-
-        let this = Self {
+        Self {
             this_runtime_id,
             that_runtime_id,
             dispatcher: MessageDispatcher::new(),
@@ -77,10 +68,7 @@ impl MessageBroker {
             monitor,
             tracker,
             span,
-        };
-
-        this.add_connection(stream, permit);
-        this
+        }
     }
 
     pub fn add_connection(&self, stream: raw::Stream, permit: ConnectionPermit) {
@@ -91,7 +79,7 @@ impl MessageBroker {
 
     /// Has this broker at least one live connection?
     pub fn has_connections(&self) -> bool {
-        !self.dispatcher.is_closed()
+        self.dispatcher.is_bound()
     }
 
     /// Try to establish a link between a local repository and a remote repository. The remote
@@ -101,11 +89,11 @@ impl MessageBroker {
         &mut self,
         vault: Vault,
         pex_repo: &PexRepository,
-        choke_manager: &choke::Manager,
+        response_limiter: Arc<Semaphore>,
     ) {
         let monitor = self.monitor.make_child(vault.monitor.name());
         let span = tracing::info_span!(
-            parent: &self.span,
+            parent: &self.span.0,
             "link",
             message = vault.monitor.name(),
         );
@@ -149,9 +137,9 @@ impl MessageBroker {
             sink: self.dispatcher.open_send(channel_id),
             vault,
             request_limiter: self.request_limiter.clone(),
+            response_limiter,
             pex_tx,
             pex_rx,
-            choker: choke_manager.new_choker(),
             monitor,
             tracker: self.tracker.clone(),
         };
@@ -175,14 +163,29 @@ impl MessageBroker {
         self.links.remove(&id);
     }
 
-    pub async fn shutdown(&self) {
-        self.dispatcher.close().await;
+    pub async fn shutdown(self) {
+        self.dispatcher.shutdown().await;
     }
 }
 
-impl Drop for MessageBroker {
+struct SpanGuard(Span);
+
+impl SpanGuard {
+    fn new(that_runtime_id: &PublicRuntimeId) -> Self {
+        let span = tracing::info_span!(
+            "message_broker",
+            message = ?that_runtime_id.as_public_key(),
+        );
+
+        tracing::info!(parent: &span, "Message broker created");
+
+        Self(span)
+    }
+}
+
+impl Drop for SpanGuard {
     fn drop(&mut self) {
-        tracing::info!(parent: &self.span, "Message broker destroyed");
+        tracing::info!(parent: &self.0, "Message broker destroyed");
     }
 }
 
@@ -192,9 +195,9 @@ struct Link {
     sink: ContentSink,
     vault: Vault,
     request_limiter: Arc<Semaphore>,
+    response_limiter: Arc<Semaphore>,
     pex_tx: PexSender,
     pex_rx: PexReceiver,
-    choker: choke::Choker,
     monitor: StateMonitor,
     tracker: TrafficTracker,
 }
@@ -263,9 +266,9 @@ impl Link {
                 crypto_sink,
                 &self.vault,
                 self.request_limiter.clone(),
+                self.response_limiter.clone(),
                 &mut self.pex_tx,
                 &mut self.pex_rx,
-                self.choker.clone(),
             )
             .await
             {
@@ -301,14 +304,11 @@ async fn run_link(
     sink: EncryptingSink<'_>,
     repo: &Vault,
     request_limiter: Arc<Semaphore>,
+    response_limiter: Arc<Semaphore>,
     pex_tx: &mut PexSender,
     pex_rx: &mut PexReceiver,
-    choker: choke::Choker,
 ) -> ControlFlow {
-    // If the peer is choked we may still receive requests from them but we won't process them until
-    // the peer is unchoked. Therefore, the capacity of this channel must be large enough to
-    // accomodate any such requests.
-    let (request_tx, request_rx) = mpsc::channel(MAX_PENDING_REQUESTS_PER_CLIENT);
+    let (request_tx, request_rx) = mpsc::channel(1);
     let (response_tx, response_rx) = mpsc::channel(1);
     let (content_tx, content_rx) = mpsc::channel(1);
 
@@ -317,7 +317,7 @@ async fn run_link(
     // Run everything in parallel:
     let flow = select! {
         flow = run_client(repo.clone(), content_tx.clone(), response_rx, request_limiter) => flow,
-        flow = run_server(repo.clone(), content_tx.clone(), request_rx, choker) => flow,
+        flow = run_server(repo.clone(), content_tx.clone(), request_rx, response_limiter) => flow,
         flow = recv_messages(stream, request_tx, response_tx, pex_rx) => flow,
         flow = send_messages(content_rx, sink) => flow,
         _ = pex_tx.run(content_tx) => ControlFlow::Continue,
@@ -425,9 +425,9 @@ async fn run_server(
     repo: Vault,
     content_tx: mpsc::Sender<Content>,
     request_rx: mpsc::Receiver<Request>,
-    choker: choke::Choker,
+    response_limiter: Arc<Semaphore>,
 ) -> ControlFlow {
-    let mut server = Server::new(repo, content_tx, request_rx, choker);
+    let mut server = Server::new(repo, content_tx, request_rx, response_limiter);
 
     let result = server.run().await;
 

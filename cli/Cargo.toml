@@ -15,10 +15,10 @@ name = "ouisync"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.57"
 async-trait = { workspace = true }
 bytes = "1.4.0"
 camino = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 dirs = "4.0.0"
 futures-util = { workspace = true }
@@ -44,12 +44,13 @@ tracing = { workspace = true }
 walkdir = "2.3.3"
 
 [dev-dependencies]
+anyhow = "1.0.57"
 assert_matches = { workspace = true }
 backoff = "0.4.0"
 hex = "0.4.3"
 once_cell = { workspace = true }
 rcgen = { workspace = true, features = ["pem"] }
-tempfile = "3.2"
+tempfile = { workspace = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "osx"))'.dev-dependencies]
 libc = "0.2.126"

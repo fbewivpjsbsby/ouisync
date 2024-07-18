@@ -5,11 +5,10 @@ use crate::{
     state::State,
     transport::{local::LocalClient, native::NativeClient},
 };
-use anyhow::Result;
 use ouisync_bridge::logger::{LogColor, LogFormat, Logger};
 use state_monitor::StateMonitor;
 use std::{
-    io,
+    env, io,
     path::{Path, PathBuf},
 };
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -20,7 +19,7 @@ pub(crate) async fn run(
     log_format: LogFormat,
     log_color: LogColor,
     request: Request,
-) -> Result<()> {
+) -> Result<(), Error> {
     let _logger = Logger::new(None, None, log_format, log_color)?;
     let client = connect(&socket, &dirs).await?;
 
@@ -61,6 +60,22 @@ pub(crate) async fn run(
                 password,
             }
         }
+        Request::Export { name, output } => Request::Export {
+            name,
+            output: to_absolute(output)?,
+        },
+        Request::Import {
+            name,
+            mode,
+            force,
+            input,
+        } => Request::Import {
+            name,
+            mode,
+            force,
+            input: to_absolute(input)?,
+        },
+
         _ => request,
     };
 
@@ -72,7 +87,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-async fn connect(path: &Path, dirs: &Dirs) -> Result<Client> {
+async fn connect(path: &Path, dirs: &Dirs) -> Result<Client, Error> {
     match LocalClient::connect(path).await {
         Ok(client) => Ok(Client::Local(client)),
         Err(error) => match error.kind() {
@@ -110,7 +125,7 @@ impl Client {
 
 /// If value is `Some("-")`, reads the value from stdin, otherwise returns it unchanged.
 // TODO: support invisible input for passwords, etc.
-async fn get_or_read(value: Option<String>, prompt: &str) -> Result<Option<String>> {
+async fn get_or_read(value: Option<String>, prompt: &str) -> Result<Option<String>, io::Error> {
     if value
         .as_ref()
         .map(|value| value.trim() == "-")
@@ -130,5 +145,13 @@ async fn get_or_read(value: Option<String>, prompt: &str) -> Result<Option<Strin
         Ok(Some(value).filter(|s| !s.is_empty()))
     } else {
         Ok(value)
+    }
+}
+
+fn to_absolute(path: PathBuf) -> Result<PathBuf, io::Error> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(env::current_dir()?.join(path))
     }
 }

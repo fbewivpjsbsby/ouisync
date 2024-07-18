@@ -75,6 +75,20 @@ pub unsafe extern "C" fn session_create_dart(
     session::create(kind, configs_path, log_path, sender).into()
 }
 
+/// Get an existing session if one was created and not yet destroyed, otherwise returns result with
+/// `error_code` set to `ErrorCode::InvalidHandle`.
+///
+/// # Safety
+///
+/// - `context` must be a valid pointer to a value that outlives the `Session` and that is safe
+///   to be sent to other threads or null.
+/// - `callback` must be a valid function pointer which does not leak the passed `msg_ptr`.
+#[no_mangle]
+pub unsafe extern "C" fn session_grab(context: *mut (), callback: Callback) -> SessionCreateResult {
+    let sender = CallbackSender::new(context, callback);
+    session::grab_shared(sender).into()
+}
+
 /// Closes the Ouisync session (common C-like API).
 ///
 /// Also gracefully disconnects from all peers and asynchronously waits for the disconnections to

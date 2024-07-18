@@ -1,9 +1,11 @@
+// --- Linux -----------------------------------------------------------------------
 #[cfg(target_os = "linux")]
 mod fuse;
 
 #[cfg(target_os = "linux")]
 pub use fuse::{mount, MountGuard, MultiRepoVFS};
 
+// --- Windows ---------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 mod dokan;
 
@@ -13,11 +15,14 @@ pub use crate::dokan::{
     single_repo_mount::{mount, MountGuard},
 };
 
+// --- Dummy -----------------------------------------------------------------------
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod dummy;
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub use dummy::{mount, MountGuard, MultiRepoVFS};
+
+// ---------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests;

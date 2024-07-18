@@ -1,18 +1,22 @@
 use crate::{
-    error::Error,
+    error::{Error, ErrorCode},
     registry::{Handle, InvalidHandle, Registry},
     state::{State, TaskHandle},
 };
 use camino::Utf8PathBuf;
 use ouisync_bridge::{protocol::Notification, repository, transport::NotificationSender};
 use ouisync_lib::{
+    crypto::Hashable,
     network::{self, Registration},
-    path, AccessMode, Credentials, Event, LocalSecret, Payload, Progress, Repository,
-    SetLocalSecret, ShareToken,
+    path,
+    sync::uninitialized_watch,
+    AccessMode, Credentials, Event, LocalSecret, Payload, Progress, Repository, SetLocalSecret,
+    ShareToken,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::Entry, HashMap},
+    ffi::OsString,
     mem,
     path::PathBuf,
     sync::{Arc, RwLock as BlockingRwLock},
@@ -60,11 +64,6 @@ pub(crate) async fn create(
         repository: Arc::new(repository),
         registration: AsyncRwLock::new(None),
     };
-
-    state
-        .mounter
-        .mount(&holder.store_path, &holder.repository)?;
-
     let handle = entry.insert(holder);
 
     Ok(handle)
@@ -105,11 +104,6 @@ pub(crate) async fn open(
         repository: Arc::new(repository),
         registration: AsyncRwLock::new(None),
     };
-
-    state
-        .mounter
-        .mount(&holder.store_path, &holder.repository)?;
-
     let handle = entry.insert(holder);
 
     Ok(handle)
@@ -259,6 +253,33 @@ pub(crate) async fn database_id(state: &State, handle: RepositoryHandle) -> Resu
     Ok(holder.repository.database_id().await?.as_ref().to_vec())
 }
 
+/// Returns database name, this is derived from the database file name, but is disambiguated when there
+/// are two or more databases with the same name (but different directories).
+/// TODO: The disambiguation
+pub(crate) fn get_name(state: &State, handle: RepositoryHandle) -> Result<OsString, Error> {
+    let holder = state.repositories.get(handle)?;
+
+    let store_path = &holder.store_path;
+
+    match store_path.with_extension("").file_name() {
+        Some(store_path) => Ok(store_path.to_os_string()),
+        None => Err(Error {
+            code: ErrorCode::MalformedData,
+            message: format!("Failed to extract file name from the path {store_path:?}"),
+        }),
+    }
+}
+
+pub(crate) fn mount(state: &State, handle: RepositoryHandle) -> Result<(), Error> {
+    let holder = state.repositories.get(handle)?;
+    state.mounter.mount(&holder.store_path, &holder.repository)
+}
+
+pub(crate) fn unmount(state: &State, handle: RepositoryHandle) -> Result<(), Error> {
+    let holder = state.repositories.get(handle)?;
+    state.mounter.unmount(&holder.store_path)
+}
+
 /// Returns the type of repository entry (file, directory, ...) or `None` if the entry doesn't
 /// exist.
 pub(crate) async fn entry_type(
@@ -273,6 +294,38 @@ pub(crate) async fn entry_type(
         Err(ouisync_lib::Error::EntryNotFound) => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Returns the hash of the version vector of a repository entry. If the entry is the root then
+/// return hash of version vectors of all the branches.
+///
+/// The use case here is for the callers to be able to find out whether an entry has changed.
+///
+/// The function returns `EntryNotFound` if the entry doesn't exists.
+pub(crate) async fn entry_version_hash(
+    state: &State,
+    handle: RepositoryHandle,
+    path: Utf8PathBuf,
+) -> Result<Vec<u8>, Error> {
+    let holder = state.repositories.get(handle)?;
+
+    let hash = match path::decompose(path.as_ref()) {
+        Some((parent, name)) => {
+            let parent_dir = holder.repository.open_directory(parent).await?;
+            parent_dir.lookup_unique(name)?.version_vector().hash()
+        }
+        None => {
+            let branches = holder.repository.load_branches().await?;
+            let mut vvs = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let vv_hash = branch.version_vector().await?.hash();
+                vvs.push(vv_hash);
+            }
+            vvs.hash()
+        }
+    };
+
+    Ok(hash.as_ref().into())
 }
 
 /// Move/rename entry from src to dst.
@@ -530,15 +583,19 @@ pub(crate) struct MetadataEdit {
 /// Registry of opened repositories.
 pub(crate) struct Repositories {
     inner: BlockingRwLock<Inner>,
+    pub on_repository_list_changed_tx: uninitialized_watch::Sender<()>,
 }
 
 impl Repositories {
     pub fn new() -> Self {
+        let (on_repository_list_changed_tx, _) = uninitialized_watch::channel();
+
         Self {
             inner: BlockingRwLock::new(Inner {
                 registry: Registry::new(),
                 index: HashMap::new(),
             }),
+            on_repository_list_changed_tx,
         }
     }
 
@@ -567,6 +624,9 @@ impl Repositories {
                             inner: &self.inner,
                             store_path,
                             inserted: false,
+                            on_repository_list_changed_tx: self
+                                .on_repository_list_changed_tx
+                                .clone(),
                         });
                     }
                 }
@@ -584,15 +644,29 @@ impl Repositories {
         let holder = inner.registry.remove(handle)?;
         inner.index.remove(&holder.store_path);
 
+        self.on_repository_list_changed_tx.send(()).unwrap_or(());
+
         Some(holder)
     }
 
     pub fn remove_all(&self) -> Vec<Arc<RepositoryHolder>> {
-        self.inner.write().unwrap().registry.remove_all()
+        let removed = self.inner.write().unwrap().registry.remove_all();
+        self.on_repository_list_changed_tx.send(()).unwrap_or(());
+        removed
     }
 
     pub fn get(&self, handle: RepositoryHandle) -> Result<Arc<RepositoryHolder>, InvalidHandle> {
         self.inner.read().unwrap().registry.get(handle).cloned()
+    }
+
+    pub fn collect(&self) -> Vec<(RepositoryHandle, Arc<RepositoryHolder>)> {
+        self.inner
+            .read()
+            .unwrap()
+            .registry
+            .iter()
+            .map(|(a, b)| (*a, b.clone()))
+            .collect()
     }
 }
 
@@ -605,6 +679,7 @@ pub(crate) struct RepositoryVacantEntry<'a> {
     inner: &'a BlockingRwLock<Inner>,
     store_path: PathBuf,
     inserted: bool,
+    on_repository_list_changed_tx: uninitialized_watch::Sender<()>,
 }
 
 impl RepositoryVacantEntry<'_> {
@@ -624,6 +699,7 @@ impl RepositoryVacantEntry<'_> {
         self.inserted = true;
 
         notify.notify_waiters();
+        self.on_repository_list_changed_tx.send(()).unwrap_or(());
 
         handle
     }

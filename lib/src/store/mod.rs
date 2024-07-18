@@ -6,12 +6,11 @@ mod changeset;
 mod error;
 mod index;
 mod inner_node;
-mod integrity;
 mod leaf_node;
 mod migrations;
+mod misc;
 mod patch;
 mod quota;
-mod receive_filter;
 mod root_node;
 
 #[cfg(test)]
@@ -23,18 +22,16 @@ pub use migrations::DATA_VERSION;
 pub(crate) use {
     block_ids::BlockIdsPage, changeset::Changeset,
     inner_node::ReceiveStatus as InnerNodeReceiveStatus,
-    leaf_node::ReceiveStatus as LeafNodeReceiveStatus, receive_filter::ReceiveFilter,
+    leaf_node::ReceiveStatus as LeafNodeReceiveStatus,
     root_node::ReceiveStatus as RootNodeReceiveStatus,
 };
 
 use self::{
     block_expiration_tracker::BlockExpirationTracker,
     cache::{Cache, CacheTransaction},
-    index::UpdateSummaryReason,
 };
 use crate::{
     block_tracker::BlockTracker as BlockDownloadTracker,
-    collections::HashSet,
     crypto::{
         sign::{Keypair, PublicKey},
         CacheHash, Hash, Hashable,
@@ -53,6 +50,7 @@ use futures_util::{Stream, TryStreamExt};
 use std::{
     borrow::Cow,
     ops::{Deref, DerefMut},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -91,7 +89,7 @@ impl Store {
 
     /// Check data integrity
     pub async fn check_integrity(&self) -> Result<bool, Error> {
-        integrity::check(self.acquire_read().await?.db()).await
+        misc::check_integrity(self.acquire_read().await?.db()).await
     }
 
     pub async fn set_block_expiration(
@@ -139,6 +137,11 @@ impl Store {
     #[cfg(test)]
     pub async fn block_expiration_tracker(&self) -> Option<Arc<BlockExpirationTracker>> {
         self.block_expiration_tracker.read().await.as_ref().cloned()
+    }
+
+    /// Export the whole repository db to the given file.
+    pub async fn export(&self, dst: &Path) -> Result<(), Error> {
+        misc::export(&mut *self.db.acquire().await?, dst).await
     }
 
     /// Acquires a `Reader`
@@ -251,10 +254,6 @@ impl Store {
         }
 
         Ok(())
-    }
-
-    pub fn receive_filter(&self) -> ReceiveFilter {
-        ReceiveFilter::new(self.db.clone())
     }
 
     /// Returns all block ids referenced from complete snapshots. The result is paginated (with
@@ -535,8 +534,7 @@ impl WriteTransaction {
 
         let parent_hashes: Vec<_> = leaf_node::load_parent_hashes(db, id).try_collect().await?;
 
-        index::update_summaries(db, cache, parent_hashes, UpdateSummaryReason::BlockRemoved)
-            .await?;
+        index::update_summaries(db, cache, parent_hashes).await?;
 
         let WriteTransaction {
             inner:
@@ -615,7 +613,6 @@ impl WriteTransaction {
     pub async fn receive_inner_nodes(
         &mut self,
         nodes: CacheHash<InnerNodes>,
-        receive_filter: &ReceiveFilter,
         quota: Option<StorageSize>,
     ) -> Result<InnerNodeReceiveStatus, Error> {
         let (db, cache) = self.db_and_cache();
@@ -625,8 +622,7 @@ impl WriteTransaction {
             return Ok(InnerNodeReceiveStatus::default());
         }
 
-        let request_children =
-            inner_node::filter_nodes_with_new_blocks(db, &nodes, receive_filter).await?;
+        let request_children = inner_node::filter_nodes_with_new_blocks(db, &nodes).await?;
 
         let mut nodes = nodes.into_inner().into_incomplete();
         inner_node::inherit_summaries(db, &mut nodes).await?;
@@ -730,39 +726,6 @@ impl WriteTransaction {
                 inner.commit().await?;
             }
         };
-
-        Ok(())
-    }
-
-    /// Remove all index ancestors nodes of the leaf node corresponding to the `block_id` from the
-    /// `receive_filter`.
-    pub async fn remove_from_receive_filter_index_nodes_for(
-        mut self,
-        block_id: BlockId,
-        receive_filter: &ReceiveFilter,
-    ) -> Result<(), Error> {
-        let mut nodes: HashSet<_> = leaf_node::load_parent_hashes(self.db(), &block_id)
-            .try_collect()
-            .await?;
-
-        let mut next_layer = HashSet::default();
-
-        for _ in 0..INNER_LAYER_COUNT {
-            for node in &nodes {
-                receive_filter.remove(self.db(), node).await?;
-
-                let mut parents = inner_node::load_parent_hashes(self.db(), node);
-
-                while let Some(parent) = parents.try_next().await? {
-                    next_layer.insert(parent);
-                }
-            }
-
-            std::mem::swap(&mut next_layer, &mut nodes);
-            next_layer.clear();
-        }
-
-        self.commit().await?;
 
         Ok(())
     }

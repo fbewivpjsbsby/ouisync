@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.19)
 
 # Project-level configuration.
 
-set(PROJECT_NAME "ouisync_plugin")
+set(PROJECT_NAME "ouisync")
 
 project(${PROJECT_NAME} LANGUAGES CXX)
 
@@ -20,7 +20,7 @@ file(CREATE_LINK ${CMAKE_SOURCE_DIR}/../ouisync ${CMAKE_SOURCE_DIR}/../ouisync/b
 FetchContent_Declare(
     Corrosion
     GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG v0.3.2 # Optionally specify a commit hash, version tag or branch here
+    GIT_TAG v0.5.0 # Optionally specify a commit hash, version tag or branch here
 )
 # Set any global configuration variables such as `Rust_TOOLCHAIN` before this line!
 FetchContent_MakeAvailable(Corrosion)
@@ -34,7 +34,7 @@ corrosion_import_crate(
 
 # This value is used when generating builds using this plugin, so it must
 # not be changed.
-set(PLUGIN_NAME "ouisync_plugin_plugin")
+set(PLUGIN_NAME "ouisync_plugin")
 
 # Define the plugin library target. Its name must not be changed (see comment
 # on PLUGIN_NAME above).
@@ -62,11 +62,11 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::GTK)
-target_link_libraries(${PLUGIN_NAME} PUBLIC ouisync-ffi)
+target_link_libraries(${PLUGIN_NAME} PUBLIC ouisync_ffi)
 
 # List of absolute paths to libraries that should be bundled with the plugin.
 # This list could contain prebuilt libraries, or libraries created by an
 # external build triggered from this build file.
-set(ouisync_plugin_bundled_libraries "${CMAKE_CURRENT_BINARY_DIR}/libouisync_ffi.so"
+set(ouisync_bundled_libraries "${CMAKE_CURRENT_BINARY_DIR}/libouisync_ffi.so"
   PARENT_SCOPE
 )

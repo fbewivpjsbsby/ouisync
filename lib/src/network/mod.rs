@@ -2,7 +2,6 @@ pub mod dht_discovery;
 pub mod peer_addr;
 
 mod barrier;
-mod choke;
 mod client;
 mod connection;
 mod connection_monitor;
@@ -10,9 +9,7 @@ mod constants;
 mod crypto;
 mod debug_payload;
 mod gateway;
-mod interface;
 mod ip;
-mod keep_alive;
 mod local_discovery;
 mod message;
 mod message_broker;
@@ -43,11 +40,13 @@ pub use self::{
     runtime_id::{PublicRuntimeId, SecretRuntimeId},
     traffic_tracker::TrafficStats,
 };
+use futures_util::future;
 pub use net::stun::NatBehavior;
 
 use self::{
     connection::{ConnectionDeduplicator, ConnectionPermit, ReserveResult},
     connection_monitor::ConnectionMonitor,
+    constants::MAX_UNCHOKED_COUNT,
     dht_discovery::{DhtContactsStoreTrait, DhtDiscovery},
     gateway::{Gateway, StackAddresses},
     local_discovery::LocalDiscovery,
@@ -79,7 +78,7 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
+    sync::{mpsc, Semaphore},
     task::{AbortHandle, JoinSet},
     time::Duration,
 };
@@ -96,10 +95,10 @@ pub struct Network {
 }
 
 impl Network {
-    #[allow(clippy::new_without_default)] // Default doesn't seem right for this
     pub fn new(
-        dht_contacts: Option<Arc<dyn DhtContactsStoreTrait>>,
         monitor: StateMonitor,
+        dht_contacts: Option<Arc<dyn DhtContactsStoreTrait>>,
+        this_runtime_id: Option<SecretRuntimeId>,
     ) -> Self {
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
         let gateway = Gateway::new(incoming_tx);
@@ -123,7 +122,7 @@ impl Network {
 
         let user_provided_peers = SeenPeers::new();
 
-        let this_runtime_id = SecretRuntimeId::random();
+        let this_runtime_id = this_runtime_id.unwrap_or_else(SecretRuntimeId::random);
         let this_runtime_id_public = this_runtime_id.public();
 
         let connections_monitor = monitor.make_child("Connections");
@@ -331,17 +330,18 @@ impl Network {
         let pex = self.inner.pex_discovery.new_repository();
         pex.set_enabled(pex_enabled);
 
-        let choke_manager = choke::Manager::new();
+        // TODO: This should be global, not per repo
+        let response_limiter = Arc::new(Semaphore::new(MAX_UNCHOKED_COUNT));
 
         let mut network_state = self.inner.state.lock().unwrap();
 
-        network_state.create_link(handle.vault.clone(), &pex, &choke_manager);
+        network_state.create_link(handle.vault.clone(), &pex, response_limiter.clone());
 
         let key = network_state.registry.insert(RegistrationHolder {
             vault: handle.vault,
             dht,
             pex,
-            choke_manager,
+            response_limiter,
         });
 
         Registration {
@@ -358,18 +358,12 @@ impl Network {
     pub async fn shutdown(&self) {
         // TODO: Would be a nice-to-have to also wait for all the spawned tasks here (e.g. dicovery
         // mechanisms).
-        let mut message_brokers = {
-            let mut state = self.inner.state.lock().unwrap();
-            match state.message_brokers.take() {
-                Some(brokers) => brokers,
-                None => {
-                    tracing::warn!("Network already shut down");
-                    return;
-                }
-            }
+        let Some(message_brokers) = self.inner.state.lock().unwrap().message_brokers.take() else {
+            tracing::warn!("Network already shut down");
+            return;
         };
 
-        shutdown_brokers(&mut message_brokers).await;
+        shutdown_brokers(message_brokers).await;
     }
 }
 
@@ -440,7 +434,7 @@ struct RegistrationHolder {
     vault: Vault,
     dht: Option<dht_discovery::LookupRequest>,
     pex: PexRepository,
-    choke_manager: choke::Manager,
+    response_limiter: Arc<Semaphore>,
 }
 
 struct Inner {
@@ -477,10 +471,10 @@ struct State {
 }
 
 impl State {
-    fn create_link(&mut self, repo: Vault, pex: &PexRepository, choke_manager: &choke::Manager) {
+    fn create_link(&mut self, repo: Vault, pex: &PexRepository, response_limiter: Arc<Semaphore>) {
         if let Some(brokers) = &mut self.message_brokers {
             for broker in brokers.values_mut() {
-                broker.create_link(repo.clone(), pex, choke_manager)
+                broker.create_link(repo.clone(), pex, response_limiter.clone())
             }
         }
     }
@@ -563,19 +557,14 @@ impl Inner {
 
     // Disconnect from all currently connected peers, regardless of their source.
     async fn disconnect_all(&self) {
-        let mut message_brokers = {
-            let mut state = self.state.lock().unwrap();
-            match &mut state.message_brokers {
-                Some(brokers) => {
-                    let mut new = HashMap::default();
-                    std::mem::swap(brokers, &mut new);
-                    new
-                }
-                None => return,
-            }
+        let Some(message_brokers) = mem::replace(
+            &mut self.state.lock().unwrap().message_brokers,
+            Some(HashMap::default()),
+        ) else {
+            return;
         };
 
-        shutdown_brokers(&mut message_brokers).await;
+        shutdown_brokers(message_brokers).await;
     }
 
     fn spawn_local_discovery(self: &Arc<Self>) -> Option<AbortHandle> {
@@ -836,39 +825,33 @@ impl Inner {
                 None => return false,
             };
 
-            match brokers.entry(that_runtime_id) {
-                Entry::Occupied(entry) => entry.get().add_connection(stream, permit),
-                Entry::Vacant(entry) => {
-                    let monitor = self
-                        .peers_monitor
-                        .make_child(format!("{:?}", that_runtime_id.as_public_key()));
+            let broker = brokers.entry(that_runtime_id).or_insert_with(|| {
+                let mut broker = self.span.in_scope(|| {
+                    MessageBroker::new(
+                        self.this_runtime_id.public(),
+                        that_runtime_id,
+                        self.pex_discovery.new_peer(),
+                        self.peers_monitor
+                            .make_child(format!("{:?}", that_runtime_id.as_public_key())),
+                        self.traffic_tracker.clone(),
+                    )
+                });
 
-                    let mut broker = self.span.in_scope(|| {
-                        MessageBroker::new(
-                            self.this_runtime_id.public(),
-                            that_runtime_id,
-                            stream,
-                            permit,
-                            self.pex_discovery.new_peer(),
-                            monitor,
-                            self.traffic_tracker.clone(),
-                        )
-                    });
-
-                    // TODO: for DHT connection we should only link the repository for which we did the
-                    // lookup but make sure we correctly handle edge cases, for example, when we have
-                    // more than one repository shared with the peer.
-                    for (_, holder) in &state.registry {
-                        broker.create_link(
-                            holder.vault.clone(),
-                            &holder.pex,
-                            &holder.choke_manager,
-                        );
-                    }
-
-                    entry.insert(broker);
+                // TODO: for DHT connection we should only link the repository for which we did the
+                // lookup but make sure we correctly handle edge cases, for example, when we have
+                // more than one repository shared with the peer.
+                for (_, holder) in &state.registry {
+                    broker.create_link(
+                        holder.vault.clone(),
+                        &holder.pex,
+                        holder.response_limiter.clone(),
+                    );
                 }
-            };
+
+                broker
+            });
+
+            broker.add_connection(stream, permit);
         }
 
         let _remover = MessageBrokerEntryGuard {
@@ -1109,14 +1092,11 @@ pub fn repository_info_hash(id: &RepositoryId) -> InfoHash {
         .unwrap()
 }
 
-async fn shutdown_brokers(message_brokers: &mut HashMap<PublicRuntimeId, MessageBroker>) {
-    let mut futures = Vec::with_capacity(message_brokers.len());
-
-    for (_runtime_id, broker) in message_brokers.drain() {
-        futures.push(async move {
-            broker.shutdown().await;
-        });
-    }
-
-    futures_util::future::join_all(futures).await;
+async fn shutdown_brokers(message_brokers: HashMap<PublicRuntimeId, MessageBroker>) {
+    future::join_all(
+        message_brokers
+            .into_values()
+            .map(|message_broker| message_broker.shutdown()),
+    )
+    .await;
 }
