@@ -83,6 +83,11 @@ jobs:
       - name: Run cli integration tests
         if: matrix.name == 'linux'
         run: ${{ matrix.cargo-command }} test --package ouisync-cli --test cli
+        
+      - name: Get upstream tags
+        run: |
+          git fetch --tags upstream
+          git push --tags
 
       - name: Build cli
         if: matrix.name == 'linux' || matrix.name == 'windows'
